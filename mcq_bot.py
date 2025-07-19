@@ -1,517 +1,454 @@
 import logging
 import os
+import tempfile
+import re
+import requests
+import json
 import asyncio
-from telegram import Update, Document, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
+
+from telegram import Update, ReplyKeyboardRemove, Poll
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     filters,
     ContextTypes,
-    CallbackQueryHandler # <-- إضافة CallbackQueryHandler
+    ConversationHandler,
 )
 from PyPDF2 import PdfReader
-import google.generativeai as genai
-import time
+from flask import Flask, request # استيراد Flask و request للويب هوك
 
-# --- أدخل التوكنات الخاصة بك هنا مباشرة ---
-TELEGRAM_BOT_TOKEN = "6608888663:AAGMZrD-c328tqXCZYEkKBjGUfCsqmPlJrk"  # <-- ضع توكن تليجرام هنا
-GOOGLE_API_KEY = "AIzaSyAB24hOiaVwfOjDl36RbpMetlBqW1a7jDs"      # <-- ضع مفتاح Google API هنا
-# -----------------------------------------
-
-# --- إعداد Logging ---
+# إعدادات التسجيل (Logging)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-# ---------------------------
 
-# التحقق من وجود التوكنات
-if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_ACTUAL_TELEGRAM_BOT_TOKEN":
-    print("ERROR: Please replace 'YOUR_ACTUAL_TELEGRAM_BOT_TOKEN' with your actual Telegram Bot Token in the code.")
-    raise ValueError("Telegram Bot Token not set correctly.")
-if not GOOGLE_API_KEY or GOOGLE_API_KEY == "YOUR_ACTUAL_GOOGLE_API_KEY":
-     print("ERROR: Please replace 'YOUR_ACTUAL_GOOGLE_API_KEY' with your actual Google API Key in the code.")
-     raise ValueError("Google API Key not set correctly.")
+# --- متغيرات البيئة (يجب تعيينها في Render) ---
+# ستقوم Render بتوفير هذه المتغيرات
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# تأكد من تحويل OWNER_ID إلى عدد صحيح
+OWNER_ID = int(os.environ.get("OWNER_ID", "0")) # قيمة افتراضية 0 لتجنب الخطأ إذا لم يتم تعيينها
 
+# --- معلومات البوت ---
+OWNER_USERNAME = "ll7ddd" # يمكنك تغيير هذا إذا كنت تريد
+BOT_PROGRAMMER_NAME = "عبدالرحمن حسن" # يمكنك تغيير هذا إذا كنت تريد
 
-# إعداد Google Generative AI SDK
-try:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    logger.info("Google Generative AI SDK configured successfully.")
-    GEMINI_MODEL = 'gemini-1.5-flash-latest'
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    logger.info(f"Using Gemini model: {GEMINI_MODEL}")
-except Exception as e:
-    logger.error(f"Failed to configure Google Generative AI SDK: {e}")
-    model = None
+# حالات المحادثة
+ASK_NUM_QUESTIONS_FOR_EXTRACTION = range(1)
 
-# --- تعريف بيانات الأزرار (Callback Data) ---
-CALLBACK_GENERATE_5 = "generate_5"
-CALLBACK_GENERATE_10 = "generate_10"
-CALLBACK_GENERATE_SPECIFY = "generate_specify"
-CALLBACK_CLEAR = "clear_pdfs"
-CALLBACK_UPLOAD_INFO = "upload_info" # زر لإظهار معلومات الرفع
+# --- دوال مساعدة ---
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """
+    يستخرج النص من ملف PDF محدد.
+    """
+    try:
+        reader = PdfReader(pdf_path)
+        text = "".join(page.extract_text() + "\n" for page in reader.pages if page.extract_text())
+        return text
+    except Exception as e:
+        logger.error(f"خطأ في استخراج نص PDF: {e}")
+        return ""
 
-# --- دالات مساعدة للمنطق الأساسي ---
+def generate_mcqs_text_blob_with_gemini(text_content: str, num_questions: int, language: str = "Arabic") -> str:
+    """
+    يولد أسئلة اختيار من متعدد (MCQs) باستخدام Gemini API.
+    """
+    if not GEMINI_API_KEY:
+        logger.error("مفتاح Gemini API غير موجود.")
+        return ""
 
-async def _perform_clear(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """المنطق الأساسي لمسح ملفات PDF."""
-    if chat_id in context.user_data and 'pdfs' in context.user_data[chat_id] and context.user_data[chat_id]['pdfs']:
-        count = len(context.user_data[chat_id]['pdfs'])
-        context.user_data[chat_id]['pdfs'] = []
-        logger.info(f"Cleared {count} PDFs for chat_id {chat_id}")
-        return f"🗑️ تم مسح {count} محاضرة/محاضرات مرفوعة بنجاح."
-    else:
-        logger.info(f"No PDFs to clear for chat_id {chat_id}")
-        return "⚠️ لا توجد محاضرات مرفوعة لمسحها."
+    api_model = "gemini-1.5-flash-latest" # يمكنك تجربة نماذج أخرى إذا أردت
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model}:generateContent?key={GEMINI_API_KEY}"
+    max_chars = 20000 # الحد الأقصى للأحرف التي يمكن إرسالها إلى Gemini
 
-async def _perform_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, num_questions_args: list[str]) -> None:
-    """المنطق الأساسي لإنشاء الأسئلة."""
-    chat_id = update.effective_chat.id
-    message = update.effective_message # رسالة الأمر أو رسالة الزر
+    # قص النص إذا كان طويلاً جداً
+    text_content = text_content[:max_chars] if len(text_content) > max_chars else text_content
 
-    if not model:
-         await message.reply_text("عذراً، هناك مشكلة في تهيئة نموذج Google AI. لا يمكن إنشاء الأسئلة حالياً.")
-         return
+    prompt = f"""
+    Generate exactly {num_questions} MCQs in {language} from the text below.
+    The questions should aim to comprehensively cover the key information and concepts from the entire provided text.
 
-    if chat_id not in context.user_data or not context.user_data[chat_id].get('pdfs'):
-        await message.reply_text("⚠️ لم يتم رفع أي ملفات PDF. يرجى رفع محاضرة واحدة على الأقل أولاً.")
+    STRICT FORMAT (EACH PART ON A NEW LINE):
+    Question: [Question text, can be multi-line ending with ? or not]
+    A) [Option A text]
+    B) [Option B text]
+    C) [Option C text]
+    D) [Option D text]
+    Correct Answer: [Correct option letter, e.g., A, B, C, or D]
+    --- (Separator, USED BETWEEN EACH MCQ, BUT NOT after the last MCQ)
+
+    Text:
+    \"\"\"
+    {text_content}
+    \"\"\"
+    CRITICAL INSTRUCTIONS:
+    1. Each question MUST have exactly 4 options (A, B, C, D). Do not generate questions with fewer than 4 options.
+    2. Ensure question text is 10-290 characters long.
+    3. Ensure each option text (A, B, C, D) is 1-90 characters long.
+    4. The "Correct Answer:" line is CRITICAL and must be present for every MCQ.
+    5. The "Correct Answer:" must be one of A, B, C, or D, corresponding to one of the provided options.
+    6. Distractor options (incorrect answers) should be plausible but clearly incorrect based on the text.
+    """
+
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192}}
+    headers = {'Content-Type': 'application/json'}
+    try:
+        response = requests.post(api_url, headers=headers, json=payload, timeout=300)
+        response.raise_for_status() # يرفع استثناء لأكواد حالة HTTP 4xx/5xx
+        generated_text_candidate = response.json().get("candidates")
+        if generated_text_candidate and len(generated_text_candidate) > 0:
+            content_parts = generated_text_candidate[0].get("content", {}).get("parts")
+            if content_parts and len(content_parts) > 0:
+                generated_text = content_parts[0].get("text", "")
+                logger.debug(f"استجابة Gemini الخام (أول 500 حرف): {generated_text[:500]}")
+                return generated_text.strip()
+        logger.error(f"استجابة Gemini API تفتقر إلى الهيكل المتوقع. الاستجابة: {response.json()}")
+        return ""
+    except requests.exceptions.Timeout:
+        logger.error(f"انتهت مهلة طلب Gemini API بعد 300 ثانية لـ {num_questions} سؤال.")
+        return ""
+    except Exception as e:
+        logger.error(f"خطأ في Gemini API: {e}", exc_info=True)
+        if hasattr(e, 'response') and e.response is not None: logger.error(f"استجابة Gemini: {e.response.text}")
+        return ""
+
+# نمط تحليل أسئلة الاختيار من متعدد
+mcq_parsing_pattern = re.compile(
+    r"Question:\s*(.*?)\s*\n"
+    r"A\)\s*(.*?)\s*\n"
+    r"B\)\s*(.*?)\s*\n"
+    r"C\)\s*(.*?)\s*\n"
+    r"D\)\s*(.*?)\s*\n"
+    r"Correct Answer:\s*([A-D])",
+    re.IGNORECASE | re.DOTALL
+)
+
+async def send_single_mcq_as_poll(mcq_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    يرسل سؤال اختيار من متعدد واحد كاستطلاع (poll) في تليجرام.
+    """
+    match = mcq_parsing_pattern.fullmatch(mcq_text.strip())
+    if not match:
+        logger.warning(f"تعذر تحليل كتلة MCQ للاستطلاع (عدم تطابق التنسيق أو ليست 4 خيارات):\n-----\n{mcq_text}\n-----")
+        return False
+    try:
+        question_text = match.group(1).strip()
+        option_a_text = match.group(2).strip()
+        option_b_text = match.group(3).strip()
+        option_c_text = match.group(4).strip()
+        option_d_text = match.group(5).strip()
+        correct_answer_letter = match.group(6).upper()
+
+        options = [option_a_text, option_b_text, option_c_text, option_d_text]
+
+        # التحقق من طول السؤال والخيارات لمتطلبات تليجرام
+        if not (1 <= len(question_text) <= 300):
+            logger.warning(f"نص سؤال الاستطلاع طويل/قصير جداً ({len(question_text)} حرف): \"{question_text[:50]}...\"")
+            return False
+        valid_options_for_poll = True
+        for i, opt_text in enumerate(options):
+            if not (1 <= len(opt_text) <= 100):
+                logger.warning(f"نص خيار الاستطلاع {i+1} طويل/قصير جداً ({len(opt_text)} حرف): \"{opt_text[:50]}...\" للسؤال \"{question_text[:50]}...\"")
+                valid_options_for_poll = False
+                break
+        if not valid_options_for_poll: return False
+
+        correct_option_id = -1
+        letter_to_id = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+        if correct_answer_letter in letter_to_id:
+            correct_option_id = letter_to_id[correct_answer_letter]
+
+        if correct_option_id == -1:
+            logger.error(f"حرف الإجابة الصحيح غير صالح '{correct_answer_letter}'. MCQ:\n{mcq_text}")
+            return False
+
+        await context.bot.send_poll(
+            chat_id=update.effective_chat.id,
+            question=question_text,
+            options=options,
+            type=Poll.QUIZ,
+            correct_option_id=correct_option_id,
+            is_anonymous=True,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"خطأ في إنشاء استطلاع من كتلة MCQ: {e}\nMCQ:\n{mcq_text}", exc_info=True)
+        return False
+
+# --- منطق تقييد الوصول (بدون حفظ بيانات المستخدمين) ---
+async def handle_restricted_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يرسل رسالة وصول مقيد للمستخدمين غير المصرح لهم.
+    لا يقوم بتخزين أي بيانات عن المستخدمين.
+    """
+    user = update.effective_user
+    if not user:
         return
 
-    num_pdfs_uploaded = len(context.user_data[chat_id]['pdfs'])
-    num_questions_per_pdf = []
+    await update.message.reply_text(
+        f"عذراً، هذا البوت يعمل بشكل حصري لمبرمجه {BOT_PROGRAMMER_NAME} (@{OWNER_USERNAME}).\n"
+        "لا يمكنك استخدام وظائفه حالياً."
+    )
+
+# --- معالجات الأوامر والمحادثات ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    يستجيب لأمر /start.
+    """
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        await handle_restricted_access(update, context)
+        return
+
+    await update.message.reply_html(
+        rf"مرحباً {update.effective_user.mention_html()}!\n"
+        rf"أرسل ملف PDF لاستخراج أسئلة منه. الأسئلة ستُحول إلى اختبارات (quiz polls) مع 4 خيارات لكل سؤال."
+    )
+
+async def handle_pdf_for_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    يتعامل مع ملفات PDF المرسلة لاستخراج النص.
+    """
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        await handle_restricted_access(update, context)
+        return ConversationHandler.END
+
+    document = update.message.document
+    if not document or not document.mime_type == "application/pdf":
+        await update.message.reply_text("من فضلك أرسل ملف PDF صالح.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("تم استلام ملف PDF. جاري معالجة النص...")
+    try:
+        pdf_file = await document.get_file()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, document.file_name or "temp.pdf")
+            await pdf_file.download_to_drive(custom_path=pdf_path)
+            text_content = extract_text_from_pdf(pdf_path)
+    except Exception as e:
+        logger.error(f"خطأ في التعامل مع المستند: {e}", exc_info=True)
+        await update.message.reply_text("حدث خطأ أثناء معالجة الملف.")
+        return ConversationHandler.END
+
+    if not text_content.strip():
+        await update.message.reply_text("لم أتمكن من استخراج أي نص من ملف PDF.")
+        return ConversationHandler.END
+
+    context.user_data['pdf_text_for_extraction'] = text_content
+    await update.message.reply_text("النص استخرج. كم سؤال (quiz poll) بأربعة خيارات تريد؟ مثال: 5. يمكنك طلب أي عدد (مثلاً 50).")
+    return ASK_NUM_QUESTIONS_FOR_EXTRACTION
+
+async def num_questions_for_extraction_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    يتعامل مع عدد الأسئلة المطلوبة من المستخدم.
+    """
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        await handle_restricted_access(update, context)
+        return ConversationHandler.END
 
     try:
-        if len(num_questions_args) == 1:
-            num_q = int(num_questions_args[0])
-            if num_q <= 0 or num_q > 20:
-                await message.reply_text("⚠️ عدد الأسئلة يجب أن يكون بين 1 و 20 لكل محاضرة.")
-                return
-            num_questions_per_pdf = [num_q] * num_pdfs_uploaded
-        elif len(num_questions_args) == num_pdfs_uploaded:
-            num_questions_per_pdf = [int(arg) for arg in num_questions_args]
-            if any(n <= 0 or n > 20 for n in num_questions_per_pdf):
-                await message.reply_text("⚠️ عدد الأسئلة لكل محاضرة يجب أن يكون بين 1 و 20.")
-                return
-        else:
-            await message.reply_text(
-                f"لقد أرسلت {num_pdfs_uploaded} محاضرة/محاضرات.\n"
-                f"تحتاج لتحديد إما عددًا واحدًا من الأسئلة (يطبق على الكل) أو {num_pdfs_uploaded} أعداد من الأسئلة باستخدام الأمر:\n"
-                f"`/generate N1 N2 ...`" # توجيه لاستخدام الأمر النصي للتحديد المخصص
-                 "\n\nأو يمكنك اختيار أحد أزرار الإنشاء السريع (مثل 5 أو 10 للكل).",
-                parse_mode='Markdown'
+        num_questions_str = update.message.text
+        if not num_questions_str.isdigit():
+            await update.message.reply_text("الرجاء إرسال رقم صحيح موجب لعدد الأسئلة.")
+            return ASK_NUM_QUESTIONS_FOR_EXTRACTION
+
+        num_questions = int(num_questions_str)
+
+        if num_questions < 1:
+            await update.message.reply_text("الرجاء إدخال رقم موجب (1 أو أكثر) لعدد الأسئلة.")
+            return ASK_NUM_QUESTIONS_FOR_EXTRACTION
+
+        if num_questions > 50:
+            await update.message.reply_text(
+                f"لقد طلبت إنشاء {num_questions} اختباراً (4 خيارات لكل سؤال). "
+                "قد تستغرق هذه العملية بعض الوقت. سأبذل قصارى جهدي!"
             )
-            return
+        elif num_questions > 20:
+             await update.message.reply_text(
+                f"جاري تجهيز {num_questions} اختباراً (4 خيارات لكل سؤال). قد يستغرق هذا بضع لحظات..."
+            )
+
     except ValueError:
-        await message.reply_text("⚠️ من فضلك أدخل أرقامًا صحيحة لعدد الأسئلة.")
-        return
+        await update.message.reply_text("الرجاء إرسال رقم صحيح موجب لعدد الأسئلة.")
+        return ASK_NUM_QUESTIONS_FOR_EXTRACTION
 
-    await message.reply_text(f"⏳ جاري إنشاء الأسئلة لـ {num_pdfs_uploaded} محاضرة/محاضرات...")
+    pdf_text = context.user_data.pop('pdf_text_for_extraction', None)
+    if not pdf_text:
+        await update.message.reply_text("خطأ: نص PDF غير موجود. أعد إرسال الملف.")
+        return ConversationHandler.END
 
-    all_results = []
-    generation_errors = 0
+    await update.message.reply_text(f"جاري استخراج {num_questions} سؤالاً (4 خيارات لكل سؤال) وتحويلها إلى اختبارات...", reply_markup=ReplyKeyboardRemove())
 
-    for i, pdf_data in enumerate(context.user_data[chat_id]['pdfs']):
-        lecture_name = pdf_data['filename']
-        lecture_text = pdf_data['text']
-        num_q_for_this_lecture = num_questions_per_pdf[i]
+    generated_mcq_text_blob = generate_mcqs_text_blob_with_gemini(pdf_text, num_questions)
 
-        if "Error:" in lecture_text or not lecture_text.strip():
-            error_msg = lecture_text if "Error:" in lecture_text else "النص المستخرج فارغ."
-            result = (f"---  LECTURE: {lecture_name} ---\n"
-                     f"❌ لا يمكن إنشاء أسئلة لهذه المحاضرة: {error_msg}")
-            all_results.append(result)
-            logger.warning(f"Skipping MCQ generation for {lecture_name} due to text extraction issue: {error_msg}")
-            generation_errors += 1
-            continue
+    if not generated_mcq_text_blob:
+        await update.message.reply_text("لم أتمكن من استخراج أسئلة من النموذج باستخدام Gemini API.")
+        return ConversationHandler.END
 
-        # إظهار إشعار بالكتابة وتحديث حالة المعالجة
-        await context.bot.send_chat_action(chat_id=chat_id, action='typing')
-        status_message_text = f"({i+1}/{num_pdfs_uploaded}) ⚙️ جاري إنشاء {num_q_for_this_lecture} سؤال/أسئلة لـ: {lecture_name}..."
-        # لا نرسل رسالة حالة لكل ملف لتجنب الإزعاج، نعتمد على الرسالة الأولية
-        logger.info(status_message_text)
-
-
-        mcqs_text = await generate_mcqs_from_text(lecture_text, num_q_for_this_lecture, lecture_name)
-
-        response_header = f"--- ✅ LECTURE: {lecture_name} ---\n\n"
-        # التحقق مما إذا كانت الاستجابة تحتوي على خطأ من الدالة نفسها
-        if "Sorry, I couldn't generate MCQs" in mcqs_text or "blocked by safety filters" in mcqs_text:
-             response_header = f"--- ⚠️ LECTURE: {lecture_name} ---\n\n"
-             generation_errors += 1
-
-
-        full_response = response_header + mcqs_text
-        all_results.append(full_response)
-
-        # تأخير بسيط
-        await asyncio.sleep(1.5)
-
-    # إرسال النتائج مجمعة
-    await message.reply_text("--- 📝 نتائج إنشاء الأسئلة ---")
-    combined_message = ""
-    for result in all_results:
-        if len(combined_message) + len(result) + 2 > 4096: # +2 for potential newlines
-            try:
-                await message.reply_text(combined_message)
-            except Exception as send_error:
-                logger.error(f"Error sending combined message part: {send_error}")
-                await message.reply_text("خطأ في إرسال جزء من النتائج.")
-            combined_message = result + "\n\n"
-        else:
-            combined_message += result + "\n\n"
-
-    if combined_message:
-        try:
-            await message.reply_text(combined_message.strip())
-        except Exception as send_error:
-             logger.error(f"Error sending final combined message part: {send_error}")
-             await message.reply_text("خطأ في إرسال الجزء الأخير من النتائج.")
-
-    final_message = "🏁 تم الانتهاء من محاولة إنشاء جميع الأسئلة المطلوبة!"
-    if generation_errors > 0:
-        final_message += f"\n\nلاحظ: واجهت مشكلة في إنشاء الأسئلة لـ {generation_errors} محاضرة/محاضرات (يرجى مراجعة النتائج أعلاه)."
-
-    final_message += "\n\n**يرجى مراجعة الأسئلة للتأكد من دقتها وملاءمتها.**"
-    final_message += "\n\nيمكنك رفع المزيد من المحاضرات أو مسح القائمة والبدء من جديد."
-    await message.reply_text(final_message)
-    # لا نمسح الملفات تلقائيًا بعد الآن، ليبقى المستخدم متحكمًا عبر زر المسح
-
-
-# --- دالة إنشاء لوحة المفاتيح الرئيسية ---
-def build_main_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> InlineKeyboardMarkup:
-    """ينشئ ويعيد لوحة المفاتيح الرئيسية."""
-    buttons = [
-        [InlineKeyboardButton("📄 إرسال ملفات المحاضرات (PDF)", callback_data=CALLBACK_UPLOAD_INFO)],
-        [
-            InlineKeyboardButton("⚡ إنشاء 5 أسئلة/محاضرة", callback_data=CALLBACK_GENERATE_5),
-            InlineKeyboardButton("⚡ إنشاء 10 أسئلة/محاضرة", callback_data=CALLBACK_GENERATE_10)
-        ],
-        [InlineKeyboardButton("⚙️ تحديد عدد الأسئلة (عبر أمر نصي)", callback_data=CALLBACK_GENERATE_SPECIFY)],
-        [InlineKeyboardButton("🗑️ مسح المحاضرات المرفوعة", callback_data=CALLBACK_CLEAR)]
+    individual_mcqs_texts = [
+        mcq.strip() for mcq in re.split(r'\s*---\s*', generated_mcq_text_blob)
+        if mcq.strip() and "Correct Answer:" in mcq and "D)" in mcq
     ]
-    # عرض عدد المحاضرات المرفوعة حاليًا إن وجد
-    pdf_count = 0
-    if chat_id in context.user_data and 'pdfs' in context.user_data[chat_id]:
-        pdf_count = len(context.user_data[chat_id]['pdfs'])
 
-    # لا نضيف الزر إذا كان العدد صفرًا - لتجنب تكرار زر المسح
-    # if pdf_count > 0:
-    #     buttons.append([InlineKeyboardButton(f"🗑️ مسح ({pdf_count}) محاضرات مرفوعة", callback_data=CALLBACK_CLEAR)])
-    # else:
-        # يمكن إضافة زر آخر هنا إذا لم تكن هناك ملفات
-        # pass
+    if not individual_mcqs_texts:
+        await update.message.reply_text("لم يتمكن Gemini من إنشاء أسئلة بالتنسيق المطلوب (4 خيارات) أو النص المستخرج فارغ.")
+        logger.warning(f"Gemini blob did not yield valid 4-option MCQs: {generated_mcq_text_blob[:300]}")
+        return ConversationHandler.END
 
-    return InlineKeyboardMarkup(buttons)
-
-# --- معالج الأوامر ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يرسل رسالة ترحيب ولوحة المفاتيح الرئيسية."""
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    logger.info(f"User {user.first_name} (ID: {user.id}) started the bot in chat {chat_id}")
-
-    # تهيئة بيانات المستخدم إذا لم تكن موجودة
-    if chat_id not in context.user_data:
-        context.user_data[chat_id] = {'pdfs': []}
-
-    keyboard = build_main_keyboard(context, chat_id)
-    await update.message.reply_html(
-        rf"أهلاً بك يا {user.mention_html()}!",
-        reply_markup=keyboard
-    )
-    await update.message.reply_text(
-         "أنا بوت إنشاء أسئلة الاختيار من متعدد (MCQs) باستخدام Google AI (Gemini).\n\n"
-         "**كيفية الاستخدام:**\n"
-         "1. اضغط على زر '📄 إرسال ملفات...' لمعرفة كيفية الرفع.\n"
-         "2. أرسل ملف أو أكثر من ملفات PDF للمحاضرات.\n"
-         "3. بعد الانتهاء من الرفع، اختر أحد أزرار 'إنشاء الأسئلة' (5 أو 10 للكل).\n"
-         "4. أو، اضغط '⚙️ تحديد عدد الأسئلة' واتبع التعليمات لإرسال أمر نصي مثل `/generate 3 7` (3 للأولى، 7 للثانية).\n"
-         "5. استخدم زر '🗑️ مسح' لمسح المحاضرات المرفوعة والبدء من جديد."
-    )
-
-
-# --- معالج نقرات الأزرار ---
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يعالج نقرات الأزرار المضمنة."""
-    query = update.callback_query
-    await query.answer() # مهم جدًا لإيقاف إشارة التحميل على الزر
-
-    callback_data = query.data
-    chat_id = query.message.chat_id
-    logger.info(f"Callback query received: {callback_data} from chat_id {chat_id}")
-
-    if callback_data == CALLBACK_UPLOAD_INFO:
-        await query.message.reply_text(
-            "📤 يرجى إرسال ملفات PDF التي تريد إنشاء أسئلة لها مباشرة في هذه الدردشة. يمكنك إرسال عدة ملفات واحدًا تلو الآخر."
+    actual_generated_count = len(individual_mcqs_texts)
+    if actual_generated_count < num_questions:
+        await update.message.reply_text(
+            f"تم طلب {num_questions} اختباراً، ولكن تمكنت من إنشاء {actual_generated_count} اختباراً فقط بالتنسيق المطلوب (4 خيارات). "
+            "قد يكون هذا بسبب طبيعة النص المدخل أو استجابة Gemini."
         )
-        # يمكن إعادة إرسال لوحة المفاتيح الرئيسية إذا أردنا أن تبقى ظاهرة
-        # keyboard = build_main_keyboard(context, chat_id)
-        # await query.edit_message_reply_markup(reply_markup=keyboard) # تحرير الرسالة الأصلية لإبقاء الأزرار
 
-    elif callback_data == CALLBACK_CLEAR:
-        clear_message = await _perform_clear(chat_id, context)
-        # تحرير الرسالة الأصلية لعرض النتيجة وتحديث الأزرار
-        keyboard = build_main_keyboard(context, chat_id)
-        try:
-            await query.edit_message_text(
-                text=f"{query.message.text}\n\n---\n{clear_message}", # إضافة النتيجة للرسالة السابقة
-                reply_markup=keyboard,
-                parse_mode='HTML' # إذا كانت الرسالة الأصلية HTML
-            )
-        except Exception as e: # قد تفشل إذا لم تتغير الرسالة أو لوحة المفاتيح
-            logger.warning(f"Failed to edit message after clear: {e}. Sending new message.")
-            await query.message.reply_text(clear_message, reply_markup=keyboard) # إرسال رسالة جديدة كبديل
+    # لا يوجد حفظ لملف MCQs هنا، سيتم إرسالها مباشرة كـ polls
+    await update.message.reply_text(f"جاري الآن إنشاء {actual_generated_count} اختباراً (quiz polls)...")
 
+    polls_created_count = 0
+    delay_between_polls = 0.25 # لتجنب تجاوز حدود تليجرام
 
-    elif callback_data == CALLBACK_GENERATE_5:
-        await _perform_generation(update, context, ['5'])
+    for mcq_text_item in individual_mcqs_texts:
+        if await send_single_mcq_as_poll(mcq_text_item, update, context):
+            polls_created_count += 1
+        # تأخير بسيط بين إرسال الاستطلاعات لتجنب تجاوز حدود معدل تليجرام
+        if actual_generated_count > 10: # فقط إذا كان هناك عدد كبير من الأسئلة
+            await asyncio.sleep(delay_between_polls)
 
-    elif callback_data == CALLBACK_GENERATE_10:
-         await _perform_generation(update, context, ['10'])
+    final_message = f"انتهت العملية.\n"
+    final_message += f"تم إنشاء {polls_created_count} اختبار (quiz poll) بنجاح (من أصل {actual_generated_count} سؤال تم إنشاؤه بواسطة Gemini بالتنسيق المطلوب)."
+    if polls_created_count < actual_generated_count:
+        final_message += f"\nتعذر إنشاء {actual_generated_count - polls_created_count} اختبار بسبب مشاكل في التنسيق لم يتم التعرف عليها أو حدود تيليجرام."
 
-    elif callback_data == CALLBACK_GENERATE_SPECIFY:
-        await query.message.reply_text(
-            "ℹ️ لتحديد عدد أسئلة مختلف لكل محاضرة، استخدم الأمر النصي بعد رفع جميع الملفات.\n"
-            "مثال: إذا رفعت محاضرتين وتريد 3 أسئلة للأولى و 7 للثانية، أرسل:\n"
-            "`/generate 3 7`\n\n"
-            "إذا أردت نفس العدد (مثلاً 4) لكل المحاضرات، أرسل:\n"
-            "`/generate 4`",
-            parse_mode='Markdown'
-        )
-        # يمكن تحديث لوحة المفاتيح هنا أيضًا إذا أردنا
-        # keyboard = build_main_keyboard(context, chat_id)
-        # await query.edit_message_reply_markup(reply_markup=keyboard)
+    await update.message.reply_text(final_message)
 
+    return ConversationHandler.END
 
-# --- معالج إرسال الملفات ---
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يعالج ملفات PDF المرسلة."""
-    chat_id = update.effective_chat.id
-    document = update.message.document
+async def cancel_extraction_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    يلغي عملية استخراج الأسئلة.
+    """
     user = update.effective_user
+    if user.id != OWNER_ID:
+        await handle_restricted_access(update, context)
+        return ConversationHandler.END
 
-    if document.mime_type == 'application/pdf':
-        if chat_id not in context.user_data or 'pdfs' not in context.user_data[chat_id]:
-            context.user_data[chat_id] = {'pdfs': []} # ضمان التهيئة
+    await update.message.reply_text("تم إلغاء العملية.", reply_markup=ReplyKeyboardRemove())
+    context.user_data.clear() # مسح بيانات المستخدم للمحادثة الحالية
+    return ConversationHandler.END
 
-        # إظهار رسالة بأن الملف قيد المعالجة
-        processing_msg = await update.message.reply_text(f"⏳ جاري معالجة الملف: {document.file_name}...")
-
-        file = await document.get_file()
-        temp_dir = "temp_pdfs"
-        os.makedirs(temp_dir, exist_ok=True)
-        file_path = os.path.join(temp_dir, f"{chat_id}_{document.file_unique_id}_{document.file_name}")
-
-        try:
-            await file.download_to_drive(custom_path=file_path)
-            logger.info(f"Downloaded PDF: {file_path} from user {user.id}")
-        except Exception as download_error:
-            logger.error(f"Failed to download file {document.file_name} from user {user.id}: {download_error}")
-            await processing_msg.edit_text(f"❌ عذراً، لم أتمكن من تحميل الملف: {document.file_name}.")
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    يتعامل مع الأخطاء التي تحدث في البوت.
+    """
+    logger.error(f"حدث خطأ {context.error} في التحديث {update}", exc_info=True)
+    if update and update.effective_message:
+        # تجنب إرسال رسائل خطأ لبعض الأخطاء الشائعة التي لا تتطلب تدخل المستخدم
+        if isinstance(context.error, TelegramError) and "message to edit not found" in str(context.error).lower():
             return
+        try:
+            # إرسال رسالة خطأ للمالك فقط
+            if update.effective_user and update.effective_user.id == OWNER_ID:
+                 await update.effective_message.reply_text(f"عذراً، حدث خطأ ما: {context.error}")
+            else:
+                # للمستخدمين غير المالكين، رسالة عامة
+                 await update.effective_message.reply_text("عذراً، حدث خطأ ما داخلياً.")
+        except Exception as e_reply:
+            logger.error(f"خطأ في إرسال رسالة الخطأ: {e_reply}")
 
-        extracted_text = extract_text_from_pdf(file_path)
+# تهيئة تطبيق Flask
+app = Flask(__name__)
 
-        final_status_message = ""
-        if "Error:" in extracted_text:
-            final_status_message = f"❌ حدث خطأ أثناء معالجة {document.file_name}: {extracted_text}"
-            logger.error(f"Text extraction error for {document.file_name} (user {user.id}): {extracted_text}")
-        elif not extracted_text.strip():
-             final_status_message = f"⚠️ لم يتم استخراج أي نص من الملف {document.file_name}. قد يكون الملف صورة أو فارغاً."
-             logger.warning(f"No text extracted from {document.file_name} (user {user.id}).")
-        else:
-            context.user_data[chat_id]['pdfs'].append({
-                'filename': document.file_name,
-                'text': extracted_text
-            })
-            pdf_count = len(context.user_data[chat_id]['pdfs'])
-            final_status_message = (
-                f"✅ تمت إضافة الملف بنجاح: {document.file_name}.\n"
-                f"📚 إجمالي المحاضرات المرفوعة الآن: {pdf_count}."
-            )
-            logger.info(f"Successfully processed {document.file_name} for user {user.id}. Total PDFs: {pdf_count}")
+# تهيئة تطبيق البوت
+application = Application.builder().token(TELEGRAM_BOT_TOKEN).build() # لا يوجد persistence
 
-        # تحرير رسالة المعالجة لعرض النتيجة النهائية
-        await processing_msg.edit_text(final_status_message)
+# إضافة المعالجات
+extraction_conv_handler = ConversationHandler(
+    entry_points=[MessageHandler(filters.Document.PDF, handle_pdf_for_extraction)],
+    states={
+        ASK_NUM_QUESTIONS_FOR_EXTRACTION: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, num_questions_for_extraction_received)
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel_extraction_command)],
+    conversation_timeout=1200
+)
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(extraction_conv_handler)
+application.add_error_handler(error_handler)
 
-        # حذف الملف المؤقت
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                logger.info(f"Removed temporary file: {file_path}")
-            except Exception as remove_error:
-                logger.error(f"Failed to remove temporary file {file_path}: {remove_error}")
+# نقطة نهاية الـ webhook
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+async def webhook_handler():
+    """
+    يتعامل مع تحديثات تليجرام الواردة عبر الويب هوك.
+    """
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        await application.process_update(update)
+    return "ok"
 
-        # إرسال لوحة المفاتيح مجددًا بعد رفع الملف لتحديث الأزرار (اختياري)
-        # keyboard = build_main_keyboard(context, chat_id)
-        # await update.message.reply_text("يمكنك الآن إرسال ملف آخر أو إنشاء الأسئلة.", reply_markup=keyboard)
+# نقطة نهاية للتحقق من أن الخادم يعمل (Health Check)
+@app.route("/")
+def index():
+    """
+    نقطة نهاية بسيطة للتحقق من أن التطبيق يعمل.
+    """
+    return "Bot is running!"
 
-    else:
-        await update.message.reply_text("⚠️ من فضلك أرسل ملف PDF فقط.")
-
-
-# --- معالج الأمر النصي generate (للتحديد المخصص) ---
-async def generate_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     """يعالج الأمر النصي /generate N1 N2 ..."""
-     logger.info(f"Received /generate command with args: {context.args} from user {update.effective_user.id}")
-     if not context.args:
-         await update.message.reply_text(
-             "⚠️ لاستخدام الأمر النصي، يرجى تحديد عدد الأسئلة.\n"
-            "مثال: `/generate 5` (5 أسئلة لكل محاضرة)\n"
-            "أو `/generate 3 7` (3 للمحاضرة الأولى، 7 للثانية).",
-             parse_mode='Markdown'
-         )
-         return
-     await _perform_generation(update, context, context.args)
-
-
-# --- معالج الأوامر غير المعروفة ---
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("عذراً، لم أفهم هذا الأمر. استخدم الأزرار أو الأمر `/start` للبدء.")
-
-# --- الدالة الرئيسية ---
-def main() -> None:
-    """يبدأ تشغيل البوت."""
-    if not model:
-        logger.error("Google AI Model is not initialized. Aborting bot startup.")
-        print("Error: Google AI Model failed to initialize. Please check your API key and configuration.")
+async def setup_webhook():
+    """
+    يقوم بإعداد الويب هوك على جانب تليجرام.
+    يجب استدعاء هذه الدالة مرة واحدة عند بدء تشغيل التطبيق.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN غير معرّف. لا يمكن إعداد الويب هوك.")
         return
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Render يوفر متغير البيئة RENDER_EXTERNAL_HOSTNAME
+    webhook_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not webhook_host:
+        logger.error("RENDER_EXTERNAL_HOSTNAME غير معرّف. الويب هوك لن يتم إعداده بشكل صحيح.")
+        return
 
-    # إضافة معالجات الأوامر والأزرار والرسائل
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("generate", generate_command_handler)) # <-- معالج الأمر النصي
-    # لم نعد بحاجة لمعالج أمر /clear منفصل، يتم التعامل معه عبر الزر
-    # application.add_handler(CommandHandler("clear", clear_pdfs_command_handler))
+    full_webhook_url = f"https://{webhook_host}/{TELEGRAM_BOT_TOKEN}"
+    logger.info(f"جاري إعداد الويب هوك إلى: {full_webhook_url}")
 
-    application.add_handler(CallbackQueryHandler(button_callback)) # <-- معالج الأزرار
-
-    application.add_handler(MessageHandler(filters.Document.PDF, handle_document)) # <-- معالج ملفات PDF
-    application.add_handler(MessageHandler(filters.Document.ALL & (~filters.Document.PDF),
-        lambda update, context: update.message.reply_text("⚠️ من فضلك أرسل ملفات PDF فقط."))) # معالج ملفات غير PDF
-
-    # معالج للأوامر غير المعروفة (يفضل أن يكون الأخير)
-    application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
-
-    logger.info("Bot is starting with Inline Keyboard and Google AI...")
-    application.run_polling()
+    try:
+        await application.bot.set_webhook(url=full_webhook_url)
+        logger.info("تم إعداد الويب هوك بنجاح.")
+    except TelegramError as e:
+        logger.error(f"فشل إعداد الويب هوك: {e}")
 
 if __name__ == "__main__":
-    # --- الكود الخاص بـ Google AI (generate_mcqs_from_text) يبقى كما هو ---
-    async def generate_mcqs_from_text(lecture_text: str, num_questions: int, lecture_name: str) -> str:
-        """ينشئ أسئلة MCQ باستخدام Google Gemini API."""
-        if not model:
-            return f"Sorry, the Google AI model client is not initialized. Cannot generate MCQs for '{lecture_name}'."
+    # تحقق من OWNER_ID عند بدء التشغيل
+    if OWNER_ID == 0: # قيمة افتراضية لتجنب الخطأ
+        logger.warning("OWNER_ID غير معرّف أو مُعيّن على القيمة الافتراضية (0). الرجاء تعيينه في متغيرات بيئة Render.")
+        print("\n" + "="*50)
+        print("هام: الرجاء تعيين 'OWNER_ID' في متغيرات بيئة Render إلى معرف مستخدم تليجرام الرقمي الخاص بك.")
+        print("="*50 + "\n")
 
-        MAX_TEXT_LENGTH = 50000
-        original_length = len(lecture_text)
-        if original_length > MAX_TEXT_LENGTH:
-            lecture_text = lecture_text[:MAX_TEXT_LENGTH]
-            warning_msg = (f"\n\n(ملاحظة: تم اقتصاص نص المحاضرة '{lecture_name}' "
-                           f"من {original_length} إلى {MAX_TEXT_LENGTH} حرفاً "
-                           f"لتجنب المشاكل المحتملة. سيتم إنشاء الأسئلة من الجزء الأول فقط.)")
-        else:
-            warning_msg = ""
+    # تشغيل إعداد الويب هوك عند بدء تشغيل التطبيق
+    # يتم تشغيل تطبيق Flask بواسطة Gunicorn على Render، لذا لا نستخدم app.run() هنا
+    # يجب أن يتم استدعاء setup_webhook() مرة واحدة عند بدء تشغيل الحاوية.
+    # أفضل طريقة للقيام بذلك هي من خلال أمر البدء في Procfile
+    # أو التأكد من أن Flask app يستدعيها عند تهيئته.
+    # في هذا الإعداد، سيتم استدعاء setup_webhook() عند بدء تشغيل Gunicorn.
+    # يمكننا تشغيلها بشكل مستقل هنا للاختبار المحلي إذا أردنا.
+    # For Render, the Gunicorn command will run the Flask app.
+    # The webhook setup should be part of the application's startup logic.
+    # A common pattern is to have a separate script for setup or call it
+    # from within the Flask app's startup.
+    # For simplicity, we'll assume Gunicorn runs the Flask app, and the
+    # webhook setup happens as part of the app's initialization or a pre-start hook.
+    # For local testing, you might run:
+    # asyncio.run(setup_webhook())
+    # app.run(port=int(os.environ.get("PORT", 5000)))
+    pass # Gunicorn will run the Flask app
 
-        prompt = f"""You are an expert AI assistant specializing in creating high-quality educational multiple-choice questions (MCQs).
-Your task is to generate exactly {num_questions} MCQs in English based ONLY on the provided lecture content from "{lecture_name}".
-
-**Instructions:**
-1.  Read the lecture content carefully.
-2.  Create {num_questions} distinct MCQs that test understanding of the key concepts in the text.
-3.  Each MCQ must follow this specific format STRICTLY:
-    [Question Number]. [Question Text]
-    A) [Option A]
-    B) [Option B]
-    C) [Option C]
-    D) [Option D]
-    Answer: [Correct Letter]
-4.  Ensure there are exactly four options (A, B, C, D) for each question.
-5.  Clearly indicate the single correct answer using "Answer: [Letter]".
-6.  **Crucially:** Do NOT include any introductory sentences, concluding remarks, explanations, apologies, or any text whatsoever outside of the MCQ questions themselves in the specified format. Your entire output should consist only of the numbered questions, options, and answers.
-
-**Lecture Content:**
---- START OF CONTENT ---
-{lecture_text}
---- END OF CONTENT ---
-
-Generate the MCQs now:
-"""
-
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        ]
-
-        generation_config = genai.types.GenerationConfig(
-            temperature=0.5
-        )
-
-        retries = 2
-        for attempt in range(retries):
-            try:
-                response = await asyncio.to_thread(
-                    model.generate_content,
-                    contents=prompt,
-                    generation_config=generation_config,
-                    safety_settings=safety_settings
-                )
-
-                if not response.candidates:
-                     block_reason = "Unknown safety block"
-                     try:
-                         block_reason = response.prompt_feedback.block_reason.name
-                     except Exception:
-                         pass
-                     error_message = f"Sorry, the request for '{lecture_name}' was blocked by safety filters (Reason: {block_reason}). This might happen with sensitive topics. Try modifying the content if possible."
-                     logger.warning(f"Safety block for '{lecture_name}': {block_reason}. Prompt feedback: {response.prompt_feedback}")
-                     return error_message
-
-                mcqs = response.text.strip()
-
-                if not mcqs or not ("Answer:" in mcqs or "A)" in mcqs):
-                     logger.warning(f"Gemini response for '{lecture_name}' seems empty or invalid: '{mcqs[:100]}...'")
-                     if attempt < retries - 1:
-                         await asyncio.sleep(2)
-                         continue
-                     else:
-                        return f"Sorry, the AI model returned an unexpected or empty response for '{lecture_name}' after {retries} attempts. Response snippet: '{mcqs[:100]}...'"
-
-                # التحقق الإضافي من التنسيق (اختياري ولكنه قد يساعد)
-                # التأكد من أن الناتج يبدأ برقم أو يحتوي على 'Answer:'
-                lines = mcqs.splitlines()
-                if not lines or not (lines[0].strip().startswith(('1.', '2.', '3.')) or 'Answer:' in lines[0]):
-                     logger.warning(f"Gemini response for '{lecture_name}' does not seem to follow the expected MCQ format. Snippet: '{mcqs[:150]}...'")
-                     # لا نعتبره خطأ فادحًا بالضرورة، لكن نسجل تحذيرًا
-
-                return mcqs + warning_msg
-
-            except Exception as e:
-                logger.error(f"Google AI API error (Attempt {attempt+1}/{retries}) for lecture {lecture_name}: {e}")
-                if attempt < retries - 1:
-                    wait_time = (attempt + 1) * 3
-                    logger.info(f"API error occurred. Retrying in {wait_time} seconds...")
-                    await asyncio.sleep(wait_time)
-                    continue
-                else:
-                    error_details = str(e)
-                    user_message = f"Sorry, I couldn't generate MCQs for '{lecture_name}'. An error occurred after {retries} attempts."
-                    if "API key not valid" in error_details:
-                        user_message += " Please check if the Google API Key in the code is correct."
-                    elif "quota" in error_details.lower():
-                         user_message += " You might have exceeded the usage limits for the free tier. Please check your Google AI Studio usage."
-                    elif "429" in error_details or "resource_exhausted" in error_details.lower():
-                         user_message += " The service is currently busy or rate limits exceeded. Please try again in a moment."
-                    else:
-                         user_message += f" Error details: {error_details[:100]}..."
-                    return user_message
-
-        return f"Sorry, I couldn't generate MCQs for '{lecture_name}' after {retries} attempts due to repeated errors."
-    # ---------------------------------------------------------------------
-    main() # <-- استدعاء الدالة الرئيسية لبدء البوت
