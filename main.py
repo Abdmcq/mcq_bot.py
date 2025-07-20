@@ -21,7 +21,6 @@ from PyPDF2 import PdfReader
 from flask import Flask, request
 
 # إعدادات التسجيل (Logging)
-# قم بتغيير المستوى إلى DEBUG مؤقتًا للحصول على معلومات أكثر تفصيلاً
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.DEBUG
 )
@@ -172,7 +171,6 @@ async def handle_restricted_access(update: Update, context: ContextTypes.DEFAULT
         logger.warning("handle_restricted_access called without effective_user.")
         return
 
-    # رسالة تسجيل إضافية هنا
     logger.info(f"User {user.id} ({user.username or user.first_name}) attempted restricted access.")
 
     await update.message.reply_text(
@@ -187,7 +185,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Start command received without effective_user.")
         return
 
-    # رسائل تسجيل إضافية هنا
     logger.info(f"Received /start command from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
 
     if user.id != OWNER_ID:
@@ -206,7 +203,6 @@ async def handle_pdf_for_extraction(update: Update, context: ContextTypes.DEFAUL
         logger.warning("PDF extraction received without effective_user.")
         return ConversationHandler.END
 
-    # رسائل تسجيل إضافية هنا
     logger.info(f"Received PDF for extraction from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
 
     if user.id != OWNER_ID:
@@ -245,7 +241,6 @@ async def num_questions_for_extraction_received(update: Update, context: Context
         logger.warning("Num questions received without effective_user.")
         return ConversationHandler.END
 
-    # رسائل تسجيل إضافية هنا
     logger.info(f"Received number of questions from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
 
     if user.id != OWNER_ID:
@@ -336,7 +331,6 @@ async def cancel_extraction_command(update: Update, context: ContextTypes.DEFAUL
         logger.warning("Cancel command received without effective_user.")
         return ConversationHandler.END
 
-    # رسالة تسجيل إضافية هنا
     logger.info(f"Received /cancel command from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
 
     if user.id != OWNER_ID:
@@ -380,6 +374,10 @@ application.add_error_handler(error_handler)
 
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 async def webhook_handler():
+    # هذا السطر سيسجل أي طلب POST يصل إلى هذا المسار
+    logger.debug(f"Received POST request on webhook path. Headers: {request.headers}")
+    logger.debug(f"Request JSON data: {request.get_json(silent=True)}")
+
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), application.bot)
         await application.process_update(update)
@@ -409,21 +407,10 @@ async def setup_webhook():
         logger.error(f"فشل إعداد الويب هوك: {e}")
 
 if __name__ == "__main__":
-    # هذا الجزء سيتم تشغيله فقط عند التشغيل المحلي المباشر لـ main.py
-    # على Render، Gunicorn هو من سيقوم بتشغيل التطبيق.
-    # لذلك، لضمان إعداد الويب هوك عند بدء تشغيل Gunicorn،
-    # يجب أن يتم استدعاء setup_webhook() كجزء من تهيئة التطبيق
-    # أو كخطوة ما قبل تشغيل Gunicorn.
-    # في هذا الإعداد، يتم استدعاء setup_webhook() بشكل ضمني
-    # عند بدء تشغيل Flask/Application.
     if OWNER_ID == 0:
         logger.warning("OWNER_ID غير معرّف أو مُعيّن على القيمة الافتراضية (0). الرجاء تعيينه في متغيرات بيئة Render.")
         print("\n" + "="*50)
         print("هام: الرجاء تعيين 'OWNER_ID' في متغيرات بيئة Render إلى معرف مستخدم تليجرام الرقمي الخاص بك.")
         print("="*50 + "\n")
-    # قم بتشغيل setup_webhook() عند بدء تشغيل التطبيق
-    # يمكننا إضافة هذا كدالة يتم استدعاؤها عند بدء تشغيل Flask
-    # أو كجزء من أمر البدء في Procfile.
-    # حالياً، يتم استدعاؤها ضمنياً في سياق تشغيل Flask.
     pass
 
