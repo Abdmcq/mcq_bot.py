@@ -18,33 +18,29 @@ from telegram.ext import (
     ConversationHandler,
 )
 from PyPDF2 import PdfReader
-from flask import Flask, request # استيراد Flask و request للويب هوك
+from flask import Flask, request
 
 # إعدادات التسجيل (Logging)
+# قم بتغيير المستوى إلى DEBUG مؤقتًا للحصول على معلومات أكثر تفصيلاً
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.DEBUG
 )
 logger = logging.getLogger(__name__)
 
 # --- متغيرات البيئة (يجب تعيينها في Render) ---
-# ستقوم Render بتوفير هذه المتغيرات
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# تأكد من تحويل OWNER_ID إلى عدد صحيح
-OWNER_ID = int(os.environ.get("OWNER_ID", "0")) # قيمة افتراضية 0 لتجنب الخطأ إذا لم يتم تعيينها
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 # --- معلومات البوت ---
-OWNER_USERNAME = "ll7ddd" # يمكنك تغيير هذا إذا كنت تريد
-BOT_PROGRAMMER_NAME = "عبدالرحمن حسن" # يمكنك تغيير هذا إذا كنت تريد
+OWNER_USERNAME = "ll7ddd"
+BOT_PROGRAMMER_NAME = "عبدالرحمن حسن"
 
 # حالات المحادثة
 ASK_NUM_QUESTIONS_FOR_EXTRACTION = range(1)
 
 # --- دوال مساعدة ---
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """
-    يستخرج النص من ملف PDF محدد.
-    """
     try:
         reader = PdfReader(pdf_path)
         text = "".join(page.extract_text() + "\n" for page in reader.pages if page.extract_text())
@@ -54,18 +50,13 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         return ""
 
 def generate_mcqs_text_blob_with_gemini(text_content: str, num_questions: int, language: str = "Arabic") -> str:
-    """
-    يولد أسئلة اختيار من متعدد (MCQs) باستخدام Gemini API.
-    """
     if not GEMINI_API_KEY:
         logger.error("مفتاح Gemini API غير موجود.")
         return ""
 
-    api_model = "gemini-1.5-flash-latest" # يمكنك تجربة نماذج أخرى إذا أردت
+    api_model = "gemini-1.5-flash-latest"
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{api_model}:generateContent?key={GEMINI_API_KEY}"
-    max_chars = 20000 # الحد الأقصى للأحرف التي يمكن إرسالها إلى Gemini
-
-    # قص النص إذا كان طويلاً جداً
+    max_chars = 20000
     text_content = text_content[:max_chars] if len(text_content) > max_chars else text_content
 
     prompt = f"""
@@ -98,7 +89,7 @@ def generate_mcqs_text_blob_with_gemini(text_content: str, num_questions: int, l
     headers = {'Content-Type': 'application/json'}
     try:
         response = requests.post(api_url, headers=headers, json=payload, timeout=300)
-        response.raise_for_status() # يرفع استثناء لأكواد حالة HTTP 4xx/5xx
+        response.raise_for_status()
         generated_text_candidate = response.json().get("candidates")
         if generated_text_candidate and len(generated_text_candidate) > 0:
             content_parts = generated_text_candidate[0].get("content", {}).get("parts")
@@ -116,7 +107,6 @@ def generate_mcqs_text_blob_with_gemini(text_content: str, num_questions: int, l
         if hasattr(e, 'response') and e.response is not None: logger.error(f"استجابة Gemini: {e.response.text}")
         return ""
 
-# نمط تحليل أسئلة الاختيار من متعدد
 mcq_parsing_pattern = re.compile(
     r"Question:\s*(.*?)\s*\n"
     r"A\)\s*(.*?)\s*\n"
@@ -128,9 +118,6 @@ mcq_parsing_pattern = re.compile(
 )
 
 async def send_single_mcq_as_poll(mcq_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    يرسل سؤال اختيار من متعدد واحد كاستطلاع (poll) في تليجرام.
-    """
     match = mcq_parsing_pattern.fullmatch(mcq_text.strip())
     if not match:
         logger.warning(f"تعذر تحليل كتلة MCQ للاستطلاع (عدم تطابق التنسيق أو ليست 4 خيارات):\n-----\n{mcq_text}\n-----")
@@ -145,7 +132,6 @@ async def send_single_mcq_as_poll(mcq_text: str, update: Update, context: Contex
 
         options = [option_a_text, option_b_text, option_c_text, option_d_text]
 
-        # التحقق من طول السؤال والخيارات لمتطلبات تليجرام
         if not (1 <= len(question_text) <= 300):
             logger.warning(f"نص سؤال الاستطلاع طويل/قصير جداً ({len(question_text)} حرف): \"{question_text[:50]}...\"")
             return False
@@ -181,13 +167,13 @@ async def send_single_mcq_as_poll(mcq_text: str, update: Update, context: Contex
 
 # --- منطق تقييد الوصول (بدون حفظ بيانات المستخدمين) ---
 async def handle_restricted_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يرسل رسالة وصول مقيد للمستخدمين غير المصرح لهم.
-    لا يقوم بتخزين أي بيانات عن المستخدمين.
-    """
     user = update.effective_user
     if not user:
+        logger.warning("handle_restricted_access called without effective_user.")
         return
+
+    # رسالة تسجيل إضافية هنا
+    logger.info(f"User {user.id} ({user.username or user.first_name}) attempted restricted access.")
 
     await update.message.reply_text(
         f"عذراً، هذا البوت يعمل بشكل حصري لمبرمجه {BOT_PROGRAMMER_NAME} (@{OWNER_USERNAME}).\n"
@@ -196,11 +182,16 @@ async def handle_restricted_access(update: Update, context: ContextTypes.DEFAULT
 
 # --- معالجات الأوامر والمحادثات ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    يستجيب لأمر /start.
-    """
     user = update.effective_user
+    if not user:
+        logger.warning("Start command received without effective_user.")
+        return
+
+    # رسائل تسجيل إضافية هنا
+    logger.info(f"Received /start command from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
+
     if user.id != OWNER_ID:
+        logger.warning(f"User {user.id} is not the owner ({OWNER_ID}). Restricting access for /start.")
         await handle_restricted_access(update, context)
         return
 
@@ -210,11 +201,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_pdf_for_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    يتعامل مع ملفات PDF المرسلة لاستخراج النص.
-    """
     user = update.effective_user
+    if not user:
+        logger.warning("PDF extraction received without effective_user.")
+        return ConversationHandler.END
+
+    # رسائل تسجيل إضافية هنا
+    logger.info(f"Received PDF for extraction from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
+
     if user.id != OWNER_ID:
+        logger.warning(f"User {user.id} is not the owner ({OWNER_ID}). Restricting access for PDF upload.")
         await handle_restricted_access(update, context)
         return ConversationHandler.END
 
@@ -244,11 +240,16 @@ async def handle_pdf_for_extraction(update: Update, context: ContextTypes.DEFAUL
     return ASK_NUM_QUESTIONS_FOR_EXTRACTION
 
 async def num_questions_for_extraction_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    يتعامل مع عدد الأسئلة المطلوبة من المستخدم.
-    """
     user = update.effective_user
+    if not user:
+        logger.warning("Num questions received without effective_user.")
+        return ConversationHandler.END
+
+    # رسائل تسجيل إضافية هنا
+    logger.info(f"Received number of questions from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
+
     if user.id != OWNER_ID:
+        logger.warning(f"User {user.id} is not the owner ({OWNER_ID}). Restricting access for num questions.")
         await handle_restricted_access(update, context)
         return ConversationHandler.END
 
@@ -276,7 +277,7 @@ async def num_questions_for_extraction_received(update: Update, context: Context
 
     except ValueError:
         await update.message.reply_text("الرجاء إرسال رقم صحيح موجب لعدد الأسئلة.")
-        return ASK_NUM_QUESTIONS_FOR_EXTRACTION
+        return ConversationHandler.END
 
     pdf_text = context.user_data.pop('pdf_text_for_extraction', None)
     if not pdf_text:
@@ -308,17 +309,16 @@ async def num_questions_for_extraction_received(update: Update, context: Context
             "قد يكون هذا بسبب طبيعة النص المدخل أو استجابة Gemini."
         )
 
-    # لا يوجد حفظ لملف MCQs هنا، سيتم إرسالها مباشرة كـ polls
     await update.message.reply_text(f"جاري الآن إنشاء {actual_generated_count} اختباراً (quiz polls)...")
 
     polls_created_count = 0
-    delay_between_polls = 0.25 # لتجنب تجاوز حدود تليجرام
+    delay_between_polls = 0.25
 
     for mcq_text_item in individual_mcqs_texts:
         if await send_single_mcq_as_poll(mcq_text_item, update, context):
             polls_created_count += 1
-        # تأخير بسيط بين إرسال الاستطلاعات لتجنب تجاوز حدود معدل تليجرام
-        if actual_generated_count > 10: # فقط إذا كان هناك عدد كبير من الأسئلة
+
+        if actual_generated_count > 10:
             await asyncio.sleep(delay_between_polls)
 
     final_message = f"انتهت العملية.\n"
@@ -331,44 +331,39 @@ async def num_questions_for_extraction_received(update: Update, context: Context
     return ConversationHandler.END
 
 async def cancel_extraction_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    يلغي عملية استخراج الأسئلة.
-    """
     user = update.effective_user
+    if not user:
+        logger.warning("Cancel command received without effective_user.")
+        return ConversationHandler.END
+
+    # رسالة تسجيل إضافية هنا
+    logger.info(f"Received /cancel command from user ID: {user.id} (OWNER_ID is: {OWNER_ID})")
+
     if user.id != OWNER_ID:
+        logger.warning(f"User {user.id} is not the owner ({OWNER_ID}). Restricting access for /cancel.")
         await handle_restricted_access(update, context)
         return ConversationHandler.END
 
     await update.message.reply_text("تم إلغاء العملية.", reply_markup=ReplyKeyboardRemove())
-    context.user_data.clear() # مسح بيانات المستخدم للمحادثة الحالية
+    context.user_data.clear()
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    يتعامل مع الأخطاء التي تحدث في البوت.
-    """
     logger.error(f"حدث خطأ {context.error} في التحديث {update}", exc_info=True)
     if update and update.effective_message:
-        # تجنب إرسال رسائل خطأ لبعض الأخطاء الشائعة التي لا تتطلب تدخل المستخدم
         if isinstance(context.error, TelegramError) and "message to edit not found" in str(context.error).lower():
             return
         try:
-            # إرسال رسالة خطأ للمالك فقط
             if update.effective_user and update.effective_user.id == OWNER_ID:
                  await update.effective_message.reply_text(f"عذراً، حدث خطأ ما: {context.error}")
             else:
-                # للمستخدمين غير المالكين، رسالة عامة
                  await update.effective_message.reply_text("عذراً، حدث خطأ ما داخلياً.")
         except Exception as e_reply:
             logger.error(f"خطأ في إرسال رسالة الخطأ: {e_reply}")
 
-# تهيئة تطبيق Flask
 app = Flask(__name__)
+application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-# تهيئة تطبيق البوت
-application = Application.builder().token(TELEGRAM_BOT_TOKEN).build() # لا يوجد persistence
-
-# إضافة المعالجات
 extraction_conv_handler = ConversationHandler(
     entry_points=[MessageHandler(filters.Document.PDF, handle_pdf_for_extraction)],
     states={
@@ -383,35 +378,22 @@ application.add_handler(CommandHandler("start", start_command))
 application.add_handler(extraction_conv_handler)
 application.add_error_handler(error_handler)
 
-# نقطة نهاية الـ webhook
 @app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 async def webhook_handler():
-    """
-    يتعامل مع تحديثات تليجرام الواردة عبر الويب هوك.
-    """
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), application.bot)
         await application.process_update(update)
     return "ok"
 
-# نقطة نهاية للتحقق من أن الخادم يعمل (Health Check)
 @app.route("/")
 def index():
-    """
-    نقطة نهاية بسيطة للتحقق من أن التطبيق يعمل.
-    """
     return "Bot is running!"
 
 async def setup_webhook():
-    """
-    يقوم بإعداد الويب هوك على جانب تليجرام.
-    يجب استدعاء هذه الدالة مرة واحدة عند بدء تشغيل التطبيق.
-    """
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN غير معرّف. لا يمكن إعداد الويب هوك.")
         return
 
-    # Render يوفر متغير البيئة RENDER_EXTERNAL_HOSTNAME
     webhook_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
     if not webhook_host:
         logger.error("RENDER_EXTERNAL_HOSTNAME غير معرّف. الويب هوك لن يتم إعداده بشكل صحيح.")
@@ -427,28 +409,21 @@ async def setup_webhook():
         logger.error(f"فشل إعداد الويب هوك: {e}")
 
 if __name__ == "__main__":
-    # تحقق من OWNER_ID عند بدء التشغيل
-    if OWNER_ID == 0: # قيمة افتراضية لتجنب الخطأ
+    # هذا الجزء سيتم تشغيله فقط عند التشغيل المحلي المباشر لـ main.py
+    # على Render، Gunicorn هو من سيقوم بتشغيل التطبيق.
+    # لذلك، لضمان إعداد الويب هوك عند بدء تشغيل Gunicorn،
+    # يجب أن يتم استدعاء setup_webhook() كجزء من تهيئة التطبيق
+    # أو كخطوة ما قبل تشغيل Gunicorn.
+    # في هذا الإعداد، يتم استدعاء setup_webhook() بشكل ضمني
+    # عند بدء تشغيل Flask/Application.
+    if OWNER_ID == 0:
         logger.warning("OWNER_ID غير معرّف أو مُعيّن على القيمة الافتراضية (0). الرجاء تعيينه في متغيرات بيئة Render.")
         print("\n" + "="*50)
         print("هام: الرجاء تعيين 'OWNER_ID' في متغيرات بيئة Render إلى معرف مستخدم تليجرام الرقمي الخاص بك.")
         print("="*50 + "\n")
-
-    # تشغيل إعداد الويب هوك عند بدء تشغيل التطبيق
-    # يتم تشغيل تطبيق Flask بواسطة Gunicorn على Render، لذا لا نستخدم app.run() هنا
-    # يجب أن يتم استدعاء setup_webhook() مرة واحدة عند بدء تشغيل الحاوية.
-    # أفضل طريقة للقيام بذلك هي من خلال أمر البدء في Procfile
-    # أو التأكد من أن Flask app يستدعيها عند تهيئته.
-    # في هذا الإعداد، سيتم استدعاء setup_webhook() عند بدء تشغيل Gunicorn.
-    # يمكننا تشغيلها بشكل مستقل هنا للاختبار المحلي إذا أردنا.
-    # For Render, the Gunicorn command will run the Flask app.
-    # The webhook setup should be part of the application's startup logic.
-    # A common pattern is to have a separate script for setup or call it
-    # from within the Flask app's startup.
-    # For simplicity, we'll assume Gunicorn runs the Flask app, and the
-    # webhook setup happens as part of the app's initialization or a pre-start hook.
-    # For local testing, you might run:
-    # asyncio.run(setup_webhook())
-    # app.run(port=int(os.environ.get("PORT", 5000)))
-    pass # Gunicorn will run the Flask app
+    # قم بتشغيل setup_webhook() عند بدء تشغيل التطبيق
+    # يمكننا إضافة هذا كدالة يتم استدعاؤها عند بدء تشغيل Flask
+    # أو كجزء من أمر البدء في Procfile.
+    # حالياً، يتم استدعاؤها ضمنياً في سياق تشغيل Flask.
+    pass
 
